@@ -1,0 +1,147 @@
+
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090d18">
+  <meta name="description" content="CraftMarket – der Marktplatz für Minecraft-Services.">
+  <title>CraftMarket | Minecraft Services</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand"><span class="brand-icon">C</span> Craft<span>Market</span></a>
+    <div id="header-user" class="header-user"></div>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div class="eyebrow"><span class="pulse"></span> MINECRAFT SERVICE MARKETPLACE</div>
+      <h1>Dein nächstes Projekt.<br><span>Dein nächster Deal.</span></h1>
+      <p>Finde Minecraft-Builder, Entwickler und andere Spieler für deinen Auftrag. Verhandle den Preis und bestätige die Fertigstellung gemeinsam.</p>
+    </section>
+
+    <div id="notice" class="notice hidden" role="status"></div>
+
+    <section id="auth-view" class="auth-layout">
+      <div class="panel auth-panel">
+        <div class="section-kicker">WILLKOMMEN ZURÜCK</div>
+        <h2>Anmelden</h2>
+        <p class="muted">Melde dich mit deinem zugewiesenen Benutzerkonto an.</p>
+        <form id="login-form">
+          <label for="login-username">Benutzername</label>
+          <input id="login-username" name="username" autocomplete="username" required maxlength="80">
+          <label for="login-password">Passwort</label>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+          <button class="btn primary full" type="submit">Einloggen <span>→</span></button>
+        </form>
+        <p class="small muted">Noch kein Konto? Dein Admin muss eines für dich erstellen.</p>
+      </div>
+      <div class="auth-side">
+        <div class="big-symbol">✦</div>
+        <h2>Spielen. Bauen.<br>Zusammenarbeiten.</h2>
+        <ul>
+          <li>◆ Preise direkt verhandeln</li>
+          <li>◆ Aufträge sicher zuordnen</li>
+          <li>◆ Abschluss gemeinsam bestätigen</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="password-view" class="panel narrow hidden">
+      <div class="section-kicker">KONTO SICHERN</div>
+      <h2>Ändere dein Startpasswort</h2>
+      <p class="muted">Bevor du den Marktplatz nutzen kannst, musst du ein neues Passwort festlegen. Verwende mindestens 12 Zeichen.</p>
+      <form id="password-form">
+        <label for="new-password">Neues Passwort</label>
+        <input id="new-password" type="password" autocomplete="new-password" minlength="12" maxlength="200" required>
+        <label for="confirm-password">Passwort wiederholen</label>
+        <input id="confirm-password" type="password" autocomplete="new-password" minlength="12" maxlength="200" required>
+        <button class="btn primary full" type="submit">Passwort ändern</button>
+      </form>
+    </section>
+
+    <section id="app-view" class="hidden">
+      <div class="dashboard-heading">
+        <div>
+          <div class="section-kicker">MARKTPLATZ</div>
+          <h2>Entdecke Aufträge</h2>
+          <p class="muted">Finde einen Auftrag oder veröffentliche deinen eigenen.</p>
+        </div>
+        <button id="logout-button" class="btn secondary">Abmelden</button>
+      </div>
+
+      <section id="admin-panel" class="panel hidden">
+        <div class="section-kicker">ADMINISTRATION</div>
+        <h2>Benutzerverwaltung</h2>
+        <p class="muted">Erstelle Konten. Das Startpasswort muss beim ersten Login geändert werden.</p>
+        <form id="user-form" class="form-grid">
+          <div>
+            <label for="new-username">Neuer Benutzername</label>
+            <input id="new-username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_]+" autocomplete="off">
+          </div>
+          <div>
+            <label for="initial-password">Startpasswort (mind. 12 Zeichen)</label>
+            <input id="initial-password" type="password" required minlength="12" maxlength="200" autocomplete="new-password">
+          </div>
+          <button class="btn primary" type="submit">Konto erstellen</button>
+        </form>
+        <div id="user-list" class="user-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-kicker">NEUES PROJEKT</div>
+        <h2>Auftrag veröffentlichen</h2>
+        <form id="job-form">
+          <label for="job-title">Titel</label>
+          <input id="job-title" required minlength="4" maxlength="100" placeholder="z. B. Medieval Spawn bauen">
+          <label for="job-description">Beschreibung</label>
+          <textarea id="job-description" required minlength="10" maxlength="3000" rows="3" placeholder="Beschreibe deinen Minecraft-Service möglichst genau ..."></textarea>
+          <div class="form-grid">
+            <div>
+              <label for="job-currency">Währung</label>
+              <select id="job-currency">
+                <option value="EUR">Euro (€)</option>
+                <option value="COINS">Minecraft-Coins</option>
+              </select>
+            </div>
+            <div>
+              <label for="job-budget">Budget</label>
+              <input id="job-budget" type="number" min="0.01" max="1000000000" step="0.01" required placeholder="z. B. 25.00">
+            </div>
+          </div>
+          <button class="btn primary" type="submit">Auftrag veröffentlichen <span>＋</span></button>
+        </form>
+      </section>
+
+      <div class="filter-row">
+        <h2>Aktuelle Aufträge</h2>
+        <button id="refresh-button" class="btn secondary">↻ Aktualisieren</button>
+      </div>
+      <div id="job-list" class="job-grid"></div>
+
+      <section id="detail-panel" class="panel hidden">
+        <div class="detail-heading">
+          <div>
+            <div class="section-kicker">AUFTRAGSDETAILS</div>
+            <h2 id="detail-title">Auftrag</h2>
+          </div>
+          <button id="close-detail" class="btn secondary" type="button">Schließen</button>
+        </div>
+        <p id="detail-description" class="detail-description"></p>
+        <div id="detail-meta" class="meta-row"></div>
+        <div id="offer-section"></div>
+        <div id="chat-section"></div>
+        <div id="confirm-section"></div>
+      </section>
+    </section>
+  </main>
+
+  <footer>
+    <span>CRAFTMARKET</span>
+    <span>Minecraft-Service-Marktplatz · Community first</span>
+  </footer>
+</body>
+</html>
