@@ -798,21 +798,17 @@ app.post("/api/jobs/:id/confirm", async (req, res, next) => {
 });
 
 
-    res.json({ job: await getJob(jobId) });
-  } catch (err) {
-    if (
-      [
-        "Auftrag kann nicht bestätigt werden.",
-        "Bereits bestätigt.",
-        "Du bist nicht an diesem Auftrag beteiligt."
-      ].includes(err.message)
-    ) {
-      return res.status(400).json({ error: err.message });
-    }
 
     next(err);
   }
 });
+
+/* Statische Website */
+
+app.use(express.static(path.join(__dirname, "public")));
+
+/* Fehlerbehandlung */
+
 
 /* Statische Website */
 
