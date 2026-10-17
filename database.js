@@ -1,4 +1,3 @@
-```js
 const { Pool, types } = require("pg");
 const bcrypt = require("bcryptjs");
 
@@ -72,9 +71,7 @@ async function initDatabase() {
 
 async function ensureAdmin(password) {
   if (!password || password.length < 12) {
-    throw new Error(
-      "ADMIN_PASSWORD muss mindestens 12 Zeichen lang sein."
-    );
+    throw new Error("ADMIN_PASSWORD muss mindestens 12 Zeichen lang sein.");
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
@@ -130,4 +127,3 @@ module.exports = {
   ensureAdmin,
   withTransaction,
 };
-```
