@@ -79,9 +79,21 @@ async function ensureAdmin(password) {
     ["Admin"]
   );
 
-  if (existing.rowCount > 0) {
-    return;
-  }
+ const bcrypt = require("bcryptjs");
+const passwordHash = await bcrypt.hash(password, 12);
+
+if (existing.rowCount > 0) {
+  await pool.query(
+    `UPDATE users
+     SET password_hash = $1,
+         role = 'admin',
+         must_change_password = TRUE
+     WHERE LOWER(username) = LOWER($2)`,
+    [passwordHash, "Admin"]
+  );
+  console.log("Admin-Passwort wurde aktualisiert.");
+  return;
+}
 
   const bcrypt = require("bcryptjs");
   const passwordHash = await bcrypt.hash(password, 12);
