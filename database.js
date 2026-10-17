@@ -19,8 +19,21 @@ async function initDatabase() {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'user',
       must_change_password BOOLEAN NOT NULL DEFAULT TRUE,
+      disabled BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+
+  // Fehlende Spalten auch bei bestehenden Datenbanken ergänzen.
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS disabled BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS must_change_password
+    BOOLEAN NOT NULL DEFAULT TRUE
   `);
 
   await pool.query(`
@@ -71,7 +84,9 @@ async function initDatabase() {
 
 async function ensureAdmin(password) {
   if (!password || password.length < 12) {
-    throw new Error("ADMIN_PASSWORD muss mindestens 12 Zeichen lang sein.");
+    throw new Error(
+      "ADMIN_PASSWORD muss mindestens 12 Zeichen lang sein."
+    );
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
@@ -86,7 +101,8 @@ async function ensureAdmin(password) {
       `UPDATE users
        SET password_hash = $1,
            role = 'admin',
-           must_change_password = TRUE
+           must_change_password = TRUE,
+           disabled = FALSE
        WHERE LOWER(username) = LOWER($2)`,
       [passwordHash, "Admin"]
     );
@@ -97,9 +113,9 @@ async function ensureAdmin(password) {
 
   await pool.query(
     `INSERT INTO users
-      (username, password_hash, role, must_change_password)
-     VALUES ($1, $2, $3, $4)`,
-    ["Admin", passwordHash, "admin", true]
+      (username, password_hash, role, must_change_password, disabled)
+     VALUES ($1, $2, $3, $4, $5)`,
+    ["Admin", passwordHash, "admin", true, false]
   );
 
   console.log("Admin-Konto wurde erstellt.");
