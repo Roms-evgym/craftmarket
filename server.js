@@ -700,9 +700,11 @@ app.get("/api/jobs/:id/messages", async (req, res, next) => {
 
 /* Auftrag bestätigen */
 
+
+/* Auftrag bestätigen und nach beidseitiger Bestätigung löschen */
 app.post("/api/jobs/:id/confirm", async (req, res, next) => {
   try {
-    const jobId = await withTransaction(async (client) => {
+    const result = await withTransaction(async (client) => {
       const found = await client.query(
         "SELECT * FROM jobs WHERE id = $1 FOR UPDATE",
         [Number(req.params.id)]
@@ -737,20 +739,64 @@ app.post("/api/jobs/:id/confirm", async (req, res, next) => {
           [current.id]
         );
       } else {
-        throw new Error("Du bist nicht an diesem Auftrag beteiligt.");
+        throw new Error(
+          "Du bist nicht an diesem Auftrag beteiligt."
+        );
       }
 
-      await client.query(
-        `UPDATE jobs
-         SET status = 'completed'
-         WHERE id = $1
-           AND buyer_confirmed = TRUE
-           AND seller_confirmed = TRUE`,
+      // Aktuellen Bestätigungsstand aus der Datenbank lesen
+      const updated = await client.query(
+        "SELECT * FROM jobs WHERE id = $1",
         [current.id]
       );
 
-      return current.id;
+      const job = updated.rows[0];
+
+      // Erst löschen, wenn beide Seiten bestätigt haben
+      if (
+        asBool(job.buyer_confirmed) &&
+        asBool(job.seller_confirmed)
+      ) {
+        await client.query(
+          "UPDATE jobs SET status = 'completed' WHERE id = $1",
+          [current.id]
+        );
+
+        await client.query(
+          "DELETE FROM jobs WHERE id = $1",
+          [current.id]
+        );
+
+        return {
+          deleted: true,
+          message: "Auftrag abgeschlossen und gelöscht."
+        };
+      }
+
+      return {
+        deleted: false,
+        buyerConfirmed: asBool(job.buyer_confirmed),
+        sellerConfirmed: asBool(job.seller_confirmed),
+        message: "Bestätigung gespeichert."
+      };
     });
+
+    res.json(result);
+  } catch (err) {
+    if (
+      [
+        "Auftrag kann nicht bestätigt werden.",
+        "Bereits bestätigt.",
+        "Du bist nicht an diesem Auftrag beteiligt."
+      ].includes(err.message)
+    ) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    next(err);
+  }
+});
+
 
     res.json({ job: await getJob(jobId) });
   } catch (err) {
