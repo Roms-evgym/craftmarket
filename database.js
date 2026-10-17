@@ -1,5 +1,6 @@
-
+```js
 const { Pool, types } = require("pg");
+const bcrypt = require("bcryptjs");
 
 types.setTypeParser(20, (value) => Number(value));
 
@@ -8,7 +9,7 @@ const pool = new Pool({
   ssl:
     process.env.PGSSLMODE === "disable"
       ? false
-      : { rejectUnauthorized: true }
+      : { rejectUnauthorized: true },
 });
 
 async function initDatabase() {
@@ -65,6 +66,8 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  console.log("Datenbanktabellen wurden überprüft.");
 }
 
 async function ensureAdmin(password) {
@@ -74,29 +77,26 @@ async function ensureAdmin(password) {
     );
   }
 
+  const passwordHash = await bcrypt.hash(password, 12);
+
   const existing = await pool.query(
     "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
     ["Admin"]
   );
 
- const bcrypt = require("bcryptjs");
-const passwordHash = await bcrypt.hash(password, 12);
+  if (existing.rowCount > 0) {
+    await pool.query(
+      `UPDATE users
+       SET password_hash = $1,
+           role = 'admin',
+           must_change_password = TRUE
+       WHERE LOWER(username) = LOWER($2)`,
+      [passwordHash, "Admin"]
+    );
 
-if (existing.rowCount > 0) {
-  await pool.query(
-    `UPDATE users
-     SET password_hash = $1,
-         role = 'admin',
-         must_change_password = TRUE
-     WHERE LOWER(username) = LOWER($2)`,
-    [passwordHash, "Admin"]
-  );
-  console.log("Admin-Passwort wurde aktualisiert.");
-  return;
-}
-
-  const bcrypt = require("bcryptjs");
-  const passwordHash = await bcrypt.hash(password, 12);
+    console.log("Admin-Passwort wurde aktualisiert.");
+    return;
+  }
 
   await pool.query(
     `INSERT INTO users
@@ -104,6 +104,8 @@ if (existing.rowCount > 0) {
      VALUES ($1, $2, $3, $4)`,
     ["Admin", passwordHash, "admin", true]
   );
+
+  console.log("Admin-Konto wurde erstellt.");
 }
 
 async function withTransaction(callback) {
@@ -126,5 +128,6 @@ module.exports = {
   pool,
   initDatabase,
   ensureAdmin,
-  withTransaction
+  withTransaction,
 };
+```
