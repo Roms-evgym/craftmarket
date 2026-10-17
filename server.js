@@ -3,64 +3,74 @@ require("dotenv").config();
 
 const express = require("express");
 const session = require("express-session");
-const SQLiteStore = require("connect-sqlite3")(session);
+const pgSession = require("connect-pg-simple")(session);
 const bcrypt = require("bcryptjs");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
 const path = require("path");
-const { db, ensureAdmin } = require("./database");
+
+const {
+  pool,
+  initDatabase,
+  ensureAdmin,
+  withTransaction
+} = require("./database");
 
 const app = express();
 const production = process.env.NODE_ENV === "production";
 
-if (!process.env.SESSION_SECRET ||
-    process.env.SESSION_SECRET.length < 32) {
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
   throw new Error("SESSION_SECRET muss mindestens 32 Zeichen lang sein.");
 }
 
-ensureAdmin(process.env.ADMIN_PASSWORD);
+if (!process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD.length < 12) {
+  throw new Error("ADMIN_PASSWORD muss mindestens 12 Zeichen lang sein.");
+}
 
 if (production) app.set("trust proxy", 1);
 
 app.disable("x-powered-by");
 
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'"],
-      imgSrc: ["'self'", "data:"],
-      connectSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      baseUri: ["'self'"],
-      frameAncestors: ["'none'"]
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'"],
+        imgSrc: ["'self'", "data:"],
+        connectSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        frameAncestors: ["'none'"]
+      }
     }
-  }
-}));
+  })
+);
 
 app.use(express.json({ limit: "20kb" }));
 
-const dataDir = process.env.DATA_DIR || __dirname;
-
-app.use(session({
-  name: "craftmarket.sid",
-  secret: process.env.SESSION_SECRET,
-  store: new SQLiteStore({
-    db: "sessions.sqlite",
-    dir: dataDir,
-    tableName: "sessions"
-  }),
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    secure: production,
-    sameSite: "strict",
-    maxAge: 8 * 60 * 60 * 1000
-  }
-}));
+app.use(
+  session({
+    name: "craftmarket.sid",
+    secret: process.env.SESSION_SECRET,
+    store: new pgSession({
+      pool,
+      tableName: "user_sessions",
+      createTableIfMissing: true,
+      pruneSessionInterval: 15 * 60
+    }),
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: production,
+      sameSite: "strict",
+      maxAge: 8 * 60 * 60 * 1000
+    }
+  })
+);
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -95,136 +105,171 @@ function clean(value, max = 1000) {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
 }
 
-function requireUser(req, res, next) {
-  if (!req.session.user) {
-    return res.status(401).json({ error: "Bitte anmelden." });
+function asBool(value) {
+  return Boolean(Number(value));
+}
+
+function publicUser(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    role: row.role,
+    mustChangePassword: asBool(row.must_change_password)
+  };
+}
+
+async function requireUser(req, res, next) {
+  try {
+    if (!req.session.user) {
+      return res.status(401).json({ error: "Bitte anmelden." });
+    }
+
+    const result = await pool.query(
+      `SELECT id, username, role, must_change_password, disabled
+       FROM users WHERE id = $1`,
+      [req.session.user.id]
+    );
+
+    const user = result.rows[0];
+
+    if (!user || asBool(user.disabled)) {
+      return req.session.destroy(() => {
+        res.status(401).json({ error: "Konto nicht verfügbar." });
+      });
+    }
+
+    req.user = user;
+
+    if (
+      asBool(user.must_change_password) &&
+      !["/password", "/logout", "/me"].includes(req.path)
+    ) {
+      return res.status(403).json({
+        error: "Bitte ändere zuerst dein Passwort.",
+        mustChangePassword: true
+      });
+    }
+
+    next();
+  } catch (err) {
+    next(err);
   }
-
-  const user = db.prepare(`
-    SELECT id, username, role, must_change_password, disabled
-    FROM users WHERE id = ?
-  `).get(req.session.user.id);
-
-  if (!user || user.disabled) {
-    return req.session.destroy(() => {
-      res.status(401).json({ error: "Konto nicht verfügbar." });
-    });
-  }
-
-  req.user = user;
-
-  if (
-    user.must_change_password &&
-    !["/password", "/logout", "/me"].includes(req.path)
-  ) {
-    return res.status(403).json({
-      error: "Bitte ändere zuerst dein Passwort.",
-      mustChangePassword: true
-    });
-  }
-
-  next();
 }
 
 function requireAdmin(req, res, next) {
   if (req.user.role !== "admin") {
     return res.status(403).json({ error: "Admin-Rechte erforderlich." });
   }
+
   next();
 }
 
-function getJob(id) {
-  return db.prepare(`
-    SELECT j.*, owner.username AS owner_name,
-           worker.username AS worker_name
-    FROM jobs j
-    JOIN users owner ON owner.id = j.owner_id
-    LEFT JOIN users worker ON worker.id = j.worker_id
-    WHERE j.id = ?
-  `).get(id);
-}
-
-function canAccessJob(job, user) {
-  return !!job && (
-    user.role === "admin" ||
-    job.owner_id === user.id ||
-    job.worker_id === user.id
+async function getJob(id, client = pool) {
+  const result = await client.query(
+    `SELECT
+       j.*,
+       owner.username AS owner_name,
+       worker.username AS worker_name
+     FROM jobs j
+     JOIN users owner ON owner.id = j.owner_id
+     LEFT JOIN users worker ON worker.id = j.worker_id
+     WHERE j.id = $1`,
+    [id]
   );
+
+  return result.rows[0] || null;
 }
 
 function validAmount(value) {
-  return Number.isSafeInteger(value) &&
+  return (
+    Number.isSafeInteger(value) &&
     value > 0 &&
-    value <= 100000000000;
+    value <= 100000000000
+  );
 }
 
-// CSRF-Token für die Anmeldung und für neue Sessions
+/* CSRF-Token */
+
 app.get("/api/csrf", (req, res) => {
   req.session.csrfToken ||= crypto.randomBytes(32).toString("hex");
   res.json({ token: req.session.csrfToken });
 });
 
-// Anmeldung
-app.post("/api/login", loginLimiter, (req, res, next) => {
-  const username = clean(req.body.username, 80);
-  const password = typeof req.body.password === "string"
-    ? req.body.password
-    : "";
+/* Anmeldung */
 
-  const user = db.prepare(
-    "SELECT * FROM users WHERE username = ? COLLATE NOCASE"
-  ).get(username);
+app.post("/api/login", loginLimiter, async (req, res, next) => {
+  try {
+    const username = clean(req.body.username, 80);
+    const password =
+      typeof req.body.password === "string" ? req.body.password : "";
 
-  if (
-    !user ||
-    user.disabled ||
-    !bcrypt.compareSync(password, user.password_hash)
-  ) {
-    return res.status(401).json({
-      error: "Benutzername oder Passwort falsch."
-    });
-  }
+    const result = await pool.query(
+      "SELECT * FROM users WHERE LOWER(username) = LOWER($1)",
+      [username]
+    );
 
-  req.session.regenerate(err => {
-    if (err) return next(err);
+    const user = result.rows[0];
 
-    req.session.user = { id: user.id };
-    req.session.csrfToken = crypto.randomBytes(32).toString("hex");
+    if (
+      !user ||
+      asBool(user.disabled) ||
+      !bcrypt.compareSync(password, user.password_hash)
+    ) {
+      return res.status(401).json({
+        error: "Benutzername oder Passwort falsch."
+      });
+    }
 
-    req.session.save(err => {
+    req.session.regenerate((err) => {
       if (err) return next(err);
 
-      res.json({
-        user: {
-          id: user.id,
-          username: user.username,
-          role: user.role,
-          mustChangePassword: !!user.must_change_password
-        },
-        csrfToken: req.session.csrfToken
+      req.session.user = { id: user.id };
+      req.session.csrfToken = crypto.randomBytes(32).toString("hex");
+
+      req.session.save((saveErr) => {
+        if (saveErr) return next(saveErr);
+
+        res.json({
+          user: publicUser(user),
+          csrfToken: req.session.csrfToken
+        });
       });
     });
-  });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Ab hier benötigen die API-Endpunkte ein angemeldetes Konto.
+/* Anmeldung für geschützte API-Routen erforderlich */
+
 app.use("/api", (req, res, next) => {
-  if (["/csrf", "/login"].includes(req.path)) return next();
+  if (["/csrf", "/login"].includes(req.path)) {
+    return next();
+  }
+
   requireUser(req, res, next);
 });
+
+/* Aktueller Benutzer */
 
 app.get("/api/me", (req, res) => {
   res.json({
     id: req.user.id,
     username: req.user.username,
     role: req.user.role,
-    mustChangePassword: !!req.user.must_change_password
+    mustChangePassword: asBool(req.user.must_change_password)
   });
 });
 
+/* Abmeldung */
+
 app.post("/api/logout", (req, res) => {
-  req.session.destroy(err => {
-    if (err) return res.status(500).json({ error: "Abmeldung fehlgeschlagen." });
+  req.session.destroy((err) => {
+    if (err) {
+      return res.status(500).json({
+        error: "Abmeldung fehlgeschlagen."
+      });
+    }
 
     res.clearCookie("craftmarket.sid", {
       httpOnly: true,
@@ -236,337 +281,528 @@ app.post("/api/logout", (req, res) => {
   });
 });
 
-// Passwortänderung beim ersten Login
-app.post("/api/password", (req, res, next) => {
-  const password = req.body.password;
+/* Passwort ändern */
 
-  if (
-    typeof password !== "string" ||
-    password.length < 12 ||
-    password.length > 200
-  ) {
-    return res.status(400).json({
-      error: "Das neue Passwort muss 12 bis 200 Zeichen haben."
-    });
-  }
+app.post("/api/password", async (req, res, next) => {
+  try {
+    const password = req.body.password;
 
-  const hash = bcrypt.hashSync(password, 12);
+    if (
+      typeof password !== "string" ||
+      password.length < 12 ||
+      password.length > 200
+    ) {
+      return res.status(400).json({
+        error: "Das neue Passwort muss 12 bis 200 Zeichen haben."
+      });
+    }
 
-  db.prepare(`
-    UPDATE users SET password_hash = ?, must_change_password = 0
-    WHERE id = ?
-  `).run(hash, req.user.id);
+    const hash = bcrypt.hashSync(password, 12);
 
-  req.session.regenerate(err => {
-    if (err) return next(err);
+    await pool.query(
+      `UPDATE users
+       SET password_hash = $1, must_change_password = 0
+       WHERE id = $2`,
+      [hash, req.user.id]
+    );
 
-    req.session.user = { id: req.user.id };
-    req.session.csrfToken = crypto.randomBytes(32).toString("hex");
+    const userId = req.user.id;
 
-    req.session.save(err => {
+    req.session.regenerate((err) => {
       if (err) return next(err);
-      res.json({ ok: true, csrfToken: req.session.csrfToken });
+
+      req.session.user = { id: userId };
+      req.session.csrfToken = crypto.randomBytes(32).toString("hex");
+
+      req.session.save((saveErr) => {
+        if (saveErr) return next(saveErr);
+
+        res.json({
+          ok: true,
+          csrfToken: req.session.csrfToken
+        });
+      });
     });
-  });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Admin: Benutzerkonto anlegen
-app.post("/api/users", requireAdmin, (req, res) => {
-  const username = clean(req.body.username, 32);
-  const password = req.body.password;
+/* Benutzer erstellen – nur Admin */
 
-  if (
-    !/^[a-zA-Z0-9_]{3,32}$/.test(username) ||
-    username.toLowerCase() === "admin"
-  ) {
-    return res.status(400).json({
-      error: "Ungültiger oder reservierter Benutzername."
-    });
-  }
-
-  if (
-    typeof password !== "string" ||
-    password.length < 12 ||
-    password.length > 200
-  ) {
-    return res.status(400).json({
-      error: "Das Startpasswort muss 12 bis 200 Zeichen haben."
-    });
-  }
-
+app.post("/api/users", requireAdmin, async (req, res, next) => {
   try {
-    const result = db.prepare(`
-      INSERT INTO users
-        (username, password_hash, role, must_change_password)
-      VALUES (?, ?, 'user', 1)
-    `).run(username, bcrypt.hashSync(password, 12));
+    const username = clean(req.body.username, 32);
+    const password = req.body.password;
+
+    if (
+      !/^[a-zA-Z0-9_]{3,32}$/.test(username) ||
+      username.toLowerCase() === "admin"
+    ) {
+      return res.status(400).json({
+        error: "Ungültiger oder reservierter Benutzername."
+      });
+    }
+
+    if (
+      typeof password !== "string" ||
+      password.length < 12 ||
+      password.length > 200
+    ) {
+      return res.status(400).json({
+        error: "Das Startpasswort muss 12 bis 200 Zeichen haben."
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO users
+         (username, password_hash, role, must_change_password)
+       VALUES ($1, $2, 'user', 1)
+       RETURNING id`,
+      [username, bcrypt.hashSync(password, 12)]
+    );
 
     res.status(201).json({
-      id: Number(result.lastInsertRowid),
+      id: result.rows[0].id,
       username,
       mustChangePassword: true
     });
   } catch (err) {
-    if (err.code === "SQLITE_CONSTRAINT_UNIQUE") {
+    if (err.code === "23505") {
       return res.status(409).json({
         error: "Dieser Benutzername ist bereits vergeben."
       });
     }
-    throw err;
+
+    next(err);
   }
 });
 
-// Admin: Benutzerliste
-app.get("/api/users", requireAdmin, (req, res) => {
-  res.json(db.prepare(`
-    SELECT id, username, role, disabled, created_at
-    FROM users ORDER BY created_at DESC
-  `).all());
+/* Benutzer auflisten – nur Admin */
+
+app.get("/api/users", requireAdmin, async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, username, role, disabled, created_at
+       FROM users ORDER BY created_at DESC`
+    );
+
+    res.json(
+      result.rows.map((row) => ({
+        ...row,
+        disabled: asBool(row.disabled)
+      }))
+    );
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Admin: Benutzer sperren
-app.post("/api/users/:id/disable", requireAdmin, (req, res) => {
-  const id = Number(req.params.id);
+/* Benutzer deaktivieren – nur Admin */
 
-  if (!Number.isSafeInteger(id) || id === req.user.id) {
-    return res.status(400).json({ error: "Ungültige Benutzer-ID." });
+app.post("/api/users/:id/disable", requireAdmin, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+
+    if (!Number.isSafeInteger(id) || id <= 0 || id === Number(req.user.id)) {
+      return res.status(400).json({
+        error: "Ungültige Benutzer-ID."
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE users SET disabled = 1
+       WHERE id = $1 AND role != 'admin'`,
+      [id]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({
+        error: "Benutzer nicht gefunden."
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
   }
-
-  const result = db.prepare(`
-    UPDATE users SET disabled = 1
-    WHERE id = ? AND role != 'admin'
-  `).run(id);
-
-  if (!result.changes) {
-    return res.status(404).json({ error: "Benutzer nicht gefunden." });
-  }
-
-  res.json({ ok: true });
 });
 
-// Aufträge auflisten
-app.get("/api/jobs", (req, res) => {
-  res.json(db.prepare(`
-    SELECT j.*, owner.username AS owner_name,
-           worker.username AS worker_name
-    FROM jobs j
-    JOIN users owner ON owner.id = j.owner_id
-    LEFT JOIN users worker ON worker.id = j.worker_id
-    ORDER BY j.id DESC
-  `).all());
+/* Aufträge auflisten */
+
+app.get("/api/jobs", async (req, res, next) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         j.*,
+         owner.username AS owner_name,
+         worker.username AS worker_name
+       FROM jobs j
+       JOIN users owner ON owner.id = j.owner_id
+       LEFT JOIN users worker ON worker.id = j.worker_id
+       ORDER BY j.id DESC`
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Neuen Auftrag erstellen
-app.post("/api/jobs", (req, res) => {
-  const title = clean(req.body.title, 100);
-  const description = clean(req.body.description, 3000);
-  const currency = req.body.currency;
-  const amount = req.body.budgetCents;
+/* Auftrag erstellen */
 
-  if (
-    title.length < 4 ||
-    description.length < 10 ||
-    !["EUR", "COINS"].includes(currency) ||
-    !validAmount(amount)
-  ) {
-    return res.status(400).json({ error: "Ungültige Auftragsdaten." });
-  }
-
-  const result = db.prepare(`
-    INSERT INTO jobs (owner_id, title, description, currency, budget_cents)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(req.user.id, title, description, currency, amount);
-
-  res.status(201).json(getJob(Number(result.lastInsertRowid)));
-});
-
-// Preisangebot senden
-app.post("/api/jobs/:id/offers", (req, res) => {
-  const job = getJob(Number(req.params.id));
-  const amount = req.body.amountCents;
-  const message = clean(req.body.message, 1000);
-
-  if (!job || job.status !== "open" || job.owner_id === req.user.id) {
-    return res.status(400).json({ error: "Auftrag ist nicht verfügbar." });
-  }
-
-  if (!validAmount(amount)) {
-    return res.status(400).json({ error: "Ungültiger Angebotspreis." });
-  }
-
-  const result = db.prepare(`
-    INSERT INTO offers (job_id, user_id, amount_cents, message)
-    VALUES (?, ?, ?, ?)
-  `).run(job.id, req.user.id, amount, message);
-
-  res.status(201).json({ id: Number(result.lastInsertRowid) });
-});
-
-// Angebote für den Auftraggeber und Admin anzeigen
-app.get("/api/jobs/:id/offers", (req, res) => {
-  const job = getJob(Number(req.params.id));
-
-  if (!job || (job.owner_id !== req.user.id && req.user.role !== "admin")) {
-    return res.status(403).json({ error: "Kein Zugriff auf diese Angebote." });
-  }
-
-  res.json(db.prepare(`
-    SELECT o.*, u.username
-    FROM offers o JOIN users u ON u.id = o.user_id
-    WHERE o.job_id = ?
-    ORDER BY o.id DESC
-  `).all(job.id));
-});
-
-// Angebot annehmen: atomare Zuweisung
-app.post("/api/offers/:id/accept", (req, res) => {
-  const tx = db.transaction(() => {
-    const offer = db.prepare(`
-      SELECT o.*, j.owner_id, j.status AS job_status, j.currency
-      FROM offers o JOIN jobs j ON j.id = o.job_id
-      WHERE o.id = ?
-    `).get(Number(req.params.id));
+app.post("/api/jobs", async (req, res, next) => {
+  try {
+    const title = clean(req.body.title, 100);
+    const description = clean(req.body.description, 3000);
+    const currency = req.body.currency;
+    const amount = req.body.budgetCents;
 
     if (
-      !offer ||
-      offer.owner_id !== req.user.id ||
-      offer.job_status !== "open" ||
-      offer.status !== "pending" ||
-      offer.user_id === offer.owner_id
+      title.length < 4 ||
+      description.length < 10 ||
+      !["EUR", "COINS"].includes(currency) ||
+      !validAmount(amount)
     ) {
-      throw new Error("Dieses Angebot kann nicht angenommen werden.");
+      return res.status(400).json({
+        error: "Ungültige Auftragsdaten."
+      });
     }
 
-    const update = db.prepare(`
-      UPDATE jobs
-      SET worker_id = ?, agreed_cents = ?, status = 'in_progress'
-      WHERE id = ? AND status = 'open'
-    `).run(offer.user_id, offer.amount_cents, offer.job_id);
+    const result = await pool.query(
+      `INSERT INTO jobs
+         (owner_id, title, description, currency, budget_cents)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [req.user.id, title, description, currency, amount]
+    );
 
-    if (update.changes !== 1) {
-      throw new Error("Der Auftrag wurde bereits vergeben.");
-    }
-
-    db.prepare(`
-      UPDATE offers SET status = 'rejected'
-      WHERE job_id = ? AND status = 'pending'
-    `).run(offer.job_id);
-
-    db.prepare(`
-      UPDATE offers SET status = 'accepted' WHERE id = ?
-    `).run(offer.id);
-
-    return offer.job_id;
-  });
-
-  try {
-    const jobId = tx();
-    res.json({ ok: true, job: getJob(jobId) });
+    res.status(201).json(await getJob(result.rows[0].id));
   } catch (err) {
-    res.status(409).json({ error: err.message });
+    next(err);
   }
 });
 
-// Chat: Auftraggeber und alle Anbieter dürfen vor Annahme verhandeln.
-// Nach Annahme dürfen nur die beiden Beteiligten schreiben.
-app.post("/api/jobs/:id/messages", (req, res) => {
-  const job = getJob(Number(req.params.id));
-  const body = clean(req.body.body, 2000);
+/* Angebot abgeben */
 
-  if (!job || !["open", "in_progress"].includes(job.status)) {
-    return res.status(400).json({ error: "Chat nicht verfügbar." });
-  }
-
-  
-const allowed = job.owner_id === req.user.id ||
-  job.worker_id === req.user.id ||
-  (job.status === "open" && req.user.id !== job.owner_id);
-
-
-  if (!allowed || body.length < 1) {
-    return res.status(403).json({ error: "Nachricht nicht erlaubt." });
-  }
-
-  const result = db.prepare(`
-    INSERT INTO messages (job_id, user_id, body)
-    VALUES (?, ?, ?)
-  `).run(job.id, req.user.id, body);
-
-  res.status(201).json({ id: Number(result.lastInsertRowid) });
-});
-
-// Chatnachrichten lesen
-app.get("/api/jobs/:id/messages", (req, res) => {
-  const job = getJob(Number(req.params.id));
-
-  if (!job) return res.status(404).json({ error: "Auftrag nicht gefunden." });
-
-  const allowed = job.owner_id === req.user.id ||
-    job.worker_id === req.user.id ||
-    (job.status === "open" && req.user.role === "admin");
-
-  if (!allowed) {
-    return res.status(403).json({ error: "Kein Zugriff auf diesen Chat." });
-  }
-
-  res.json(db.prepare(`
-    SELECT m.id, m.user_id, u.username, m.body, m.created_at
-    FROM messages m JOIN users u ON u.id = m.user_id
-    WHERE m.job_id = ? ORDER BY m.id ASC
-  `).all(job.id));
-});
-
-// Auftrag separat als Käufer oder Verkäufer bestätigen
-app.post("/api/jobs/:id/confirm", (req, res) => {
-  const tx = db.transaction(() => {
-    const job = getJob(Number(req.params.id));
-
-    if (!job || job.status !== "in_progress" || !job.worker_id) {
-      throw new Error("Auftrag kann nicht bestätigt werden.");
-    }
-
-    if (req.user.id === job.owner_id) {
-      if (job.buyer_confirmed) throw new Error("Bereits bestätigt.");
-
-      db.prepare(`
-        UPDATE jobs SET buyer_confirmed = 1 WHERE id = ?
-      `).run(job.id);
-    } else if (req.user.id === job.worker_id) {
-      if (job.seller_confirmed) throw new Error("Bereits bestätigt.");
-
-      db.prepare(`
-        UPDATE jobs SET seller_confirmed = 1 WHERE id = ?
-      `).run(job.id);
-    } else {
-      throw new Error("Du bist nicht an diesem Auftrag beteiligt.");
-    }
-
-    db.prepare(`
-      UPDATE jobs SET status = 'completed'
-      WHERE id = ? AND buyer_confirmed = 1 AND seller_confirmed = 1
-    `).run(job.id);
-
-    return getJob(job.id);
-  });
-
+app.post("/api/jobs/:id/offers", async (req, res, next) => {
   try {
-    res.json({ job: tx() });
+    const job = await getJob(Number(req.params.id));
+    const amount = req.body.amountCents;
+    const message = clean(req.body.message, 1000);
+
+    if (
+      !job ||
+      job.status !== "open" ||
+      Number(job.owner_id) === Number(req.user.id)
+    ) {
+      return res.status(400).json({
+        error: "Auftrag ist nicht verfügbar."
+      });
+    }
+
+    if (!validAmount(amount)) {
+      return res.status(400).json({
+        error: "Ungültiger Angebotspreis."
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO offers (job_id, user_id, amount_cents, message)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [job.id, req.user.id, amount, message]
+    );
+
+    res.status(201).json({ id: result.rows[0].id });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    next(err);
   }
 });
 
-// Frontend-Dateien bereitstellen
+/* Angebote eines Auftrags anzeigen */
+
+app.get("/api/jobs/:id/offers", async (req, res, next) => {
+  try {
+    const job = await getJob(Number(req.params.id));
+
+    if (
+      !job ||
+      (Number(job.owner_id) !== Number(req.user.id) &&
+        req.user.role !== "admin")
+    ) {
+      return res.status(403).json({
+        error: "Kein Zugriff auf diese Angebote."
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT o.*, u.username
+       FROM offers o
+       JOIN users u ON u.id = o.user_id
+       WHERE o.job_id = $1
+       ORDER BY o.id DESC`,
+      [job.id]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* Angebot annehmen */
+
+app.post("/api/offers/:id/accept", async (req, res, next) => {
+  try {
+    const jobId = await withTransaction(async (client) => {
+      const result = await client.query(
+        `SELECT o.*, j.owner_id, j.status AS job_status
+         FROM offers o
+         JOIN jobs j ON j.id = o.job_id
+         WHERE o.id = $1
+         FOR UPDATE OF j, o`,
+        [Number(req.params.id)]
+      );
+
+      const offer = result.rows[0];
+
+      if (
+        !offer ||
+        Number(offer.owner_id) !== Number(req.user.id) ||
+        offer.job_status !== "open" ||
+        offer.status !== "pending" ||
+        Number(offer.user_id) === Number(offer.owner_id)
+      ) {
+        throw new Error("Dieses Angebot kann nicht angenommen werden.");
+      }
+
+      const update = await client.query(
+        `UPDATE jobs
+         SET worker_id = $1,
+             agreed_cents = $2,
+             status = 'in_progress'
+         WHERE id = $3 AND status = 'open'`,
+        [offer.user_id, offer.amount_cents, offer.job_id]
+      );
+
+      if (update.rowCount !== 1) {
+        throw new Error("Der Auftrag wurde bereits vergeben.");
+      }
+
+      await client.query(
+        `UPDATE offers SET status = 'rejected'
+         WHERE job_id = $1 AND status = 'pending'`,
+        [offer.job_id]
+      );
+
+      await client.query(
+        "UPDATE offers SET status = 'accepted' WHERE id = $1",
+        [offer.id]
+      );
+
+      return offer.job_id;
+    });
+
+    res.json({
+      ok: true,
+      job: await getJob(jobId)
+    });
+  } catch (err) {
+    if (
+      [
+        "Dieses Angebot kann nicht angenommen werden.",
+        "Der Auftrag wurde bereits vergeben."
+      ].includes(err.message)
+    ) {
+      return res.status(409).json({ error: err.message });
+    }
+
+    next(err);
+  }
+});
+
+/* Nachricht senden */
+
+app.post("/api/jobs/:id/messages", async (req, res, next) => {
+  try {
+    const job = await getJob(Number(req.params.id));
+    const body = clean(req.body.body, 2000);
+
+    if (!job || !["open", "in_progress"].includes(job.status)) {
+      return res.status(400).json({
+        error: "Chat nicht verfügbar."
+      });
+    }
+
+    const allowed =
+      Number(job.owner_id) === Number(req.user.id) ||
+      Number(job.worker_id) === Number(req.user.id) ||
+      (job.status === "open" &&
+        Number(req.user.id) !== Number(job.owner_id));
+
+    if (!allowed || body.length < 1) {
+      return res.status(403).json({
+        error: "Nachricht nicht erlaubt."
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO messages (job_id, user_id, body)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [job.id, req.user.id, body]
+    );
+
+    res.status(201).json({ id: result.rows[0].id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* Nachrichten eines Auftrags anzeigen */
+
+app.get("/api/jobs/:id/messages", async (req, res, next) => {
+  try {
+    const job = await getJob(Number(req.params.id));
+
+    if (!job) {
+      return res.status(404).json({
+        error: "Auftrag nicht gefunden."
+      });
+    }
+
+    const allowed =
+      Number(job.owner_id) === Number(req.user.id) ||
+      Number(job.worker_id) === Number(req.user.id) ||
+      (job.status === "open" && req.user.role === "admin");
+
+    if (!allowed) {
+      return res.status(403).json({
+        error: "Kein Zugriff auf diesen Chat."
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT m.id, m.user_id, u.username, m.body, m.created_at
+       FROM messages m
+       JOIN users u ON u.id = m.user_id
+       WHERE m.job_id = $1
+       ORDER BY m.id ASC`,
+      [job.id]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* Auftrag bestätigen */
+
+app.post("/api/jobs/:id/confirm", async (req, res, next) => {
+  try {
+    const jobId = await withTransaction(async (client) => {
+      const found = await client.query(
+        "SELECT * FROM jobs WHERE id = $1 FOR UPDATE",
+        [Number(req.params.id)]
+      );
+
+      const current = found.rows[0];
+
+      if (
+        !current ||
+        current.status !== "in_progress" ||
+        !current.worker_id
+      ) {
+        throw new Error("Auftrag kann nicht bestätigt werden.");
+      }
+
+      if (Number(req.user.id) === Number(current.owner_id)) {
+        if (asBool(current.buyer_confirmed)) {
+          throw new Error("Bereits bestätigt.");
+        }
+
+        await client.query(
+          "UPDATE jobs SET buyer_confirmed = 1 WHERE id = $1",
+          [current.id]
+        );
+      } else if (Number(req.user.id) === Number(current.worker_id)) {
+        if (asBool(current.seller_confirmed)) {
+          throw new Error("Bereits bestätigt.");
+        }
+
+        await client.query(
+          "UPDATE jobs SET seller_confirmed = 1 WHERE id = $1",
+          [current.id]
+        );
+      } else {
+        throw new Error("Du bist nicht an diesem Auftrag beteiligt.");
+      }
+
+      await client.query(
+        `UPDATE jobs
+         SET status = 'completed'
+         WHERE id = $1
+           AND buyer_confirmed = 1
+           AND seller_confirmed = 1`,
+        [current.id]
+      );
+
+      return current.id;
+    });
+
+    res.json({ job: await getJob(jobId) });
+  } catch (err) {
+    if (
+      [
+        "Auftrag kann nicht bestätigt werden.",
+        "Bereits bestätigt.",
+        "Du bist nicht an diesem Auftrag beteiligt."
+      ].includes(err.message)
+    ) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    next(err);
+  }
+});
+
+/* Statische Website */
+
 app.use(express.static(path.join(__dirname, "public")));
 
+/* Fehlerbehandlung */
+
 app.use((err, req, res, next) => {
-  console.error(err.message);
-  if (res.headersSent) return next(err);
-  res.status(500).json({ error: "Interner Serverfehler." });
+  console.error(err);
+
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  res.status(500).json({
+    error: "Interner Serverfehler."
+  });
 });
+
+/* Datenbank zuerst initialisieren, dann Admin anlegen, dann Server starten */
 
 const port = Number(process.env.PORT || 3000);
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`CraftMarket läuft auf Port ${port}.`);
+async function startServer() {
+  await initDatabase();
+  console.log("Datenbanktabellen wurden überprüft.");
+
+  await ensureAdmin(process.env.ADMIN_PASSWORD);
+  console.log("Admin-Konto wurde überprüft.");
+
+  app.listen(port, "0.0.0.0", () => {
+    console.log(`CraftMarket läuft auf Port ${port}.`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error("CraftMarket konnte nicht gestartet werden:", err);
+  process.exit(1);
 });
