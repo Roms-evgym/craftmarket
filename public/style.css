@@ -101,7 +101,7 @@ p { margin-top: 0; }
 .hidden { display: none !important; }
 
 .panel {
-  background: linear-gradient(145deg, #141e2e, #101725);
+  background: linear-gradient(145deg, #ffffff 0%, #f5f0ff 50%, #e9ddff 100%);
   border: 1px solid var(--border);
   border-radius: 17px;
   padding: 24px;
