@@ -1,4 +1,6 @@
 
-const allowed = job.owner_id === req.user.id ||
-  job.worker_id === req.user.id ||
-  (job.status === "open" && req.user.id !== job.owner_id);
+const allowed =
+  Number(job.owner_id) === Number(req.user.id) ||
+  Number(job.worker_id) === Number(req.user.id) ||
+  (job.status === "open" &&
+   Number(req.user.id) !== Number(job.owner_id));
