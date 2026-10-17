@@ -698,10 +698,8 @@ app.get("/api/jobs/:id/messages", async (req, res, next) => {
   }
 });
 
-/* Auftrag bestätigen */
-
-
 /* Auftrag bestätigen und nach beidseitiger Bestätigung löschen */
+
 app.post("/api/jobs/:id/confirm", async (req, res, next) => {
   try {
     const result = await withTransaction(async (client) => {
@@ -739,12 +737,9 @@ app.post("/api/jobs/:id/confirm", async (req, res, next) => {
           [current.id]
         );
       } else {
-        throw new Error(
-          "Du bist nicht an diesem Auftrag beteiligt."
-        );
+        throw new Error("Du bist nicht an diesem Auftrag beteiligt.");
       }
 
-      // Aktuellen Bestätigungsstand aus der Datenbank lesen
       const updated = await client.query(
         "SELECT * FROM jobs WHERE id = $1",
         [current.id]
@@ -752,16 +747,10 @@ app.post("/api/jobs/:id/confirm", async (req, res, next) => {
 
       const job = updated.rows[0];
 
-      // Erst löschen, wenn beide Seiten bestätigt haben
       if (
         asBool(job.buyer_confirmed) &&
         asBool(job.seller_confirmed)
       ) {
-        await client.query(
-          "UPDATE jobs SET status = 'completed' WHERE id = $1",
-          [current.id]
-        );
-
         await client.query(
           "DELETE FROM jobs WHERE id = $1",
           [current.id]
@@ -796,19 +785,6 @@ app.post("/api/jobs/:id/confirm", async (req, res, next) => {
     next(err);
   }
 });
-
-
-
-    next(err);
-  }
-});
-
-/* Statische Website */
-
-app.use(express.static(path.join(__dirname, "public")));
-
-/* Fehlerbehandlung */
-
 
 /* Statische Website */
 
